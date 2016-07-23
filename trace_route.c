@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <net/if.h>
 #include <netinet/if_ether.h>
 #include <arpa/inet.h>
@@ -29,11 +30,31 @@ struct datagramInfo{
 	unsigned char is_intermediate;
 };
 
+struct pendingRtt{
+	int port;
+	struct timeval last_fregment_sent;
+	struct timeval rtt;
+	unsigned char is_paried;
+};
 
+struct rttInfo{
+	char src_str[15];
+	char dst_str[15];
+	double* rttArray;
+	int rttArrayLength;
+	int rttArraySize;
+	double rttSum;
+};
 
 struct datagramInfo* datagramInfoArray;
 int datagramInfoArrayLength;
 int datagramInfoArraySize;
+struct rttInfo* rttInfoArray;
+int rttInfoArrayLength;
+int rttInfoArraySize;
+struct pendingRtt* pendingRttArray;
+int pendingRttArrayLength;
+int pendingRttArraySize;
 
 struct sendInfo{
 	struct timeval time[1000];
@@ -54,6 +75,35 @@ struct intermediateArray{
 	int size;
 }inters;
 
+/* Subtract the ‘struct timeval’ values X and Y,
+ *    storing the result in RESULT.
+ *       Return 1 if the difference is negative, otherwise 0. */
+
+int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval *y)
+{
+	  /* Perform the carry for the later subtraction by updating y. */
+	  if (x->tv_usec < y->tv_usec) {
+		      int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
+			      y->tv_usec -= 1000000 * nsec;
+				      y->tv_sec += nsec;
+					    
+	  }
+	    if (x->tv_usec - y->tv_usec > 1000000) {
+			    int nsec = (x->tv_usec - y->tv_usec) / 1000000;
+				    y->tv_usec += 1000000 * nsec;
+					    y->tv_sec -= nsec;
+						  
+		}
+
+		  /* Compute the time remaining to wait.
+		   *      tv_usec is certainly positive. */
+		  result->tv_sec = x->tv_sec - y->tv_sec;
+		    result->tv_usec = x->tv_usec - y->tv_usec;
+
+			  /* Return 1 if result is negative. */
+			  return x->tv_sec < y->tv_sec;
+			  
+}
 
 int dump_packet(const unsigned char* packet, struct timeval ts, unsigned int capture_len) {
 	struct ip *ip;
@@ -164,9 +214,10 @@ void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int
 	packet += sizeof(struct ether_header);
 	ip = (struct ip*) packet;
 	int protocol_type = ip->ip_p;
-	int icmpHeaderOffset = ip->ip_hl << 2;
-	printf("Header size: %d\n", icmpHeaderOffset);
-	icmp = (struct icmphdr*) (packet + icmpHeaderOffset);
+	int nextHeaderOffset = ip->ip_hl << 2;
+	printf("Header size: %d\n", nextHeaderOffset);
+	icmp = (struct icmphdr*) (packet + nextHeaderOffset);
+	udp = (struct udphdr*) (packet + nextHeaderOffset);
 	int icmp_code = icmp->code;
 	printf("IP_P: %d\n", ip->ip_p);
 	char isIntermediateNode = (ip->ip_p == 1 && icmp->code == 0 &&icmp->type == 11);
@@ -204,6 +255,80 @@ void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int
 		inters.size = 0;
 	}
 	if(start) {
+		if(ip->ip_p == 1 && icmp->code == 0 &&icmp->type == 11){
+			//ICMP
+			//Time-to-live execeeded, try to get the port number
+			struct ip* short_ip_header = (struct ip*) (packet + nextHeaderOffset + 8);
+			struct udphdr* short_udp_header = (struct udphdr*) (packet + nextHeaderOffset + 8 + (short_ip_header->ip_hl << 2));
+			char hop_ip[15];
+			int port = ntohs(short_udp_header->source);
+			int m;
+			strcpy(hop_ip, inet_ntoa(ip->ip_src));
+			printf(">>>>>>>>>>>>>>>>>>> %s:%d\n", hop_ip, port);
+			for(m = 0; m < pendingRttArrayLength; m++){
+				if(pendingRttArray[m].is_paried){
+					continue;
+				}else if(pendingRttArray[m].port == port){
+					// Try to find the rtt Info object
+					int p;
+					for(p = 0; p < rttInfoArrayLength; p++){
+						if(strcmp(rttInfoArray[p].dst_str, hop_ip) == 0){
+							break;
+						}
+					}	
+					timeval_subtract(&pendingRttArray[m].rtt, &ts, &pendingRttArray[m].last_fregment_sent);
+					double time_diff = pendingRttArray[m].rtt.tv_sec * 1000.0 + pendingRttArray[m].rtt.tv_usec / 1000.0;
+
+					if(p != rttInfoArrayLength){
+						// The rttInfo object is found
+						if(rttInfoArray[p].rttArrayLength == rttInfoArray[p].rttArraySize){
+							rttInfoArray[p].rttArray = realloc(rttInfoArray[p].rttArray, sizeof(double) * rttInfoArray[p].rttArraySize * 2);
+							rttInfoArray[p].rttArraySize *= 2;
+						}
+						rttInfoArray[p].rttArray[rttInfoArray[p].rttArrayLength] = time_diff;
+						rttInfoArray[p].rttArrayLength++;
+						rttInfoArray[p].rttSum += time_diff;
+					}else{
+						if(rttInfoArrayLength == rttInfoArraySize){
+							rttInfoArray = realloc(rttInfoArray, sizeof(struct rttInfo) * rttInfoArraySize * 2);
+							rttInfoArraySize *= 2;
+						}	
+
+						// Else, create a new one
+						strcpy(rttInfoArray[rttInfoArrayLength].src_str, inet_ntoa(ip->ip_dst));
+						strcpy(rttInfoArray[rttInfoArrayLength].dst_str, hop_ip);
+						rttInfoArray[rttInfoArrayLength].rttArray = malloc(sizeof(double) * 1);
+						rttInfoArray[rttInfoArrayLength].rttArrayLength = 1;
+						rttInfoArray[rttInfoArrayLength].rttArraySize = 1;
+						rttInfoArray[rttInfoArrayLength].rttArray[0] = time_diff;
+						rttInfoArray[rttInfoArrayLength].rttSum = time_diff;
+						rttInfoArrayLength++;
+					}
+					pendingRttArray[m].is_paried = 1;
+				}
+			}
+
+			
+			
+		}else if(ip->ip_p == 17 && !(ip->ip_off & IP_MF)){
+			//UDP
+			//Add port number into pending rtt list
+			int port = ntohs(udp->source);
+			char host_ip[15];
+			strcpy(host_ip, inet_ntoa(src));
+			// This is a possible pending rtt entry
+			if(pendingRttArrayLength == pendingRttArraySize){
+				pendingRttArray = realloc(pendingRttArray, sizeof(struct pendingRtt) * pendingRttArraySize * 2);
+				pendingRttArraySize *= 2;
+			}
+			pendingRttArray[pendingRttArrayLength].port = port;
+			pendingRttArray[pendingRttArrayLength].last_fregment_sent.tv_sec = ts.tv_sec;
+			pendingRttArray[pendingRttArrayLength].last_fregment_sent.tv_usec = ts.tv_usec;
+			pendingRttArray[pendingRttArrayLength].is_paried = 0;
+			pendingRttArrayLength++;
+
+//			printf(">>>>>>>>>IP: %s, PORT = %d\n", src_ip_str, ntohs(udp->source));
+		}
 //printf("src address is ------%s\n",inet_ntoa(src));
 //printf("src add ------%s\n",inet_ntoa(ip->ip_src));
 //printf("dst add ------%s\n",inet_ntoa(ip->ip_dst));
@@ -220,11 +345,9 @@ printf("dst add ------%s\n",inet_ntoa(ip->ip_dst));
 			char tempPartialKey_Positive[50];
 			sprintf(tempPartialKey_Positive, "%s:%s", src_str, dst_str);
 			for(i = 0; i < datagramInfoArrayLength; i++){
-				printf("key: %s, partial: %s\n", datagramInfoArray[i].key, tempPartialKey_Positive);
+				printf("key: %s partial key: %s\n", datagramInfoArray[i].key, tempPartialKey_Positive);
 				if((strncmp(datagramInfoArray[i].key, tempPartialKey_Positive, strlen(tempPartialKey_Positive)) == 0)){
-					printf(">>>>Pair matched\n");
 					datagramInfoArray[i].is_intermediate = 1;
-					printf(">>>>>>>>>>>>>>%d\n", datagramInfoArray[i].number_of_fragments);
 				}
 			}
 printf("add print end--------------\n");
@@ -245,7 +368,6 @@ printf("add print end--------------\n");
 	if(hasFragment == 0) { //IP_MF - 1: the fragment is the last one
 	
 		if(ip->ip_dst.s_addr != src.s_addr ){
-		
 			theLastFragment = cap_length;
 			printf("the last frag is %d\n", cap_length);
 			printf("bbbbbb\n");
@@ -330,6 +452,21 @@ void print_result() {
 		avgRTT(inters.intermediate[i]);
 		printf("inters size is:%d\n ", inters.intermediate[i]);
 	}
+
+	printf("===============\n");
+	int k;
+	for(k = 0; k < rttInfoArrayLength; k++){
+		printf("RTT From: %s To: %s is:\n", rttInfoArray[k].src_str, rttInfoArray[k].dst_str);
+		int l;
+		double average = rttInfoArray[k].rttSum / rttInfoArray[k].rttArrayLength; 
+		printf("\tAverage RTT: %f\n", average);
+		double partialSum = 0;
+		for(l = 0; l < rttInfoArray[k].rttArrayLength; l++){
+			partialSum += pow((rttInfoArray[k].rttArray[l] - average), 2);
+		}
+		double sd = sqrt(partialSum / rttInfoArray[k].rttArrayLength);
+		printf("SD: %g\n", sd);
+	}
 }
 
 int main(int argc, char *argv[]){
@@ -340,6 +477,12 @@ int main(int argc, char *argv[]){
 	datagramInfoArray = malloc(sizeof(struct datagramInfo) * 1);
 	datagramInfoArrayLength = 0;
 	datagramInfoArraySize = 1;
+	rttInfoArray = malloc(sizeof(struct rttInfo) * 1);
+	rttInfoArrayLength = 0;
+	rttInfoArraySize = 1;
+	pendingRttArray = malloc(sizeof(struct pendingRtt) * 1);
+	pendingRttArrayLength = 0;
+	pendingRttArraySize = 1;
 
 
 	if (argc < 2){
