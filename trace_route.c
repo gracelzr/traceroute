@@ -26,7 +26,9 @@ struct datagramInfo{
 	char key[50];
 	int number_of_fragments;	
 	int last_fragment_offset;
+	unsigned char is_intermediate;
 };
+
 
 
 struct datagramInfo* datagramInfoArray;
@@ -128,26 +130,24 @@ void updateDatagramInfo(char* key, unsigned short fragment_offset){
 	printf("Key: %s Offset: %u\n", key, (fragment_offset * 8));
 	int i;
 	for(i = 0; i < datagramInfoArrayLength; i++){
-		puts(datagramInfoArray[i].key);
 		if(strcmp(datagramInfoArray[i].key, key) == 0){
 			datagramInfoArray[i].number_of_fragments++;
 			if(fragment_offset > datagramInfoArray[i].last_fragment_offset){
-				datagramInfoArray[i].last_fragment_offset = fragment_offset;
+				datagramInfoArray[i].last_fragment_offset = fragment_offset * 8;
 			}
 			printf("Fragment detected!!!!\n");
 			return;
 		}
 	}
 	if(datagramInfoArrayLength == datagramInfoArraySize){
-		datagramInfoArray = realloc(datagramInfoArray, datagramInfoArraySize * 2);
-		printf(">>>>>>%f\n", datagramInfoArray);
+		datagramInfoArray = realloc(datagramInfoArray, sizeof(struct datagramInfo) * datagramInfoArraySize * 2);
 		datagramInfoArraySize *= 2;
 	}
 	strcpy(datagramInfoArray[datagramInfoArrayLength].key, key);
 	datagramInfoArray[datagramInfoArrayLength].number_of_fragments = 0;
 	datagramInfoArray[datagramInfoArrayLength].last_fragment_offset = 0;
+	datagramInfoArray[datagramInfoArrayLength].is_intermediate = 0;
 	datagramInfoArrayLength++;
-	printf(">>>>Information updated: %d %d\n", datagramInfoArrayLength, datagramInfoArraySize);
 }
 
 void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int cap_length){
@@ -172,8 +172,10 @@ void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int
 	char isIntermediateNode = (ip->ip_p == 1 && icmp->code == 0 &&icmp->type == 11);
 	int temp = ip->ip_id;
 	int id = (temp>>8) | (temp<<8);
-	char* src_ip_str = inet_ntoa(ip->ip_src);
-	char* dst_ip_str = inet_ntoa(ip->ip_dst);
+	char src_ip_str[15];
+	strcpy(src_ip_str, inet_ntoa(ip->ip_src));
+	char dst_ip_str[15];
+	strcpy(dst_ip_str, inet_ntoa(ip->ip_dst));
 	char key[50];
 	sprintf(key, "%s:%s:%d", src_ip_str, dst_ip_str, id);
 	//printf(">>>>>%s\n", key);
@@ -210,9 +212,24 @@ printf("add print start--------------\n");
 printf("src add ------%s\n",inet_ntoa(ip->ip_src));
 printf("dst add ------%s\n",inet_ntoa(ip->ip_dst));
 			update_Recv_Time(ip->ip_src, ts);
+			int i;
+			char src_str[15];
+			char dst_str[15];
+			strcpy(src_str, inet_ntoa(src));
+			strcpy(dst_str, inet_ntoa(dst));
+			char tempPartialKey_Positive[50];
+			sprintf(tempPartialKey_Positive, "%s:%s", src_str, dst_str);
+			for(i = 0; i < datagramInfoArrayLength; i++){
+				printf("key: %s, partial: %s\n", datagramInfoArray[i].key, tempPartialKey_Positive);
+				if((strncmp(datagramInfoArray[i].key, tempPartialKey_Positive, strlen(tempPartialKey_Positive)) == 0)){
+					printf(">>>>Pair matched\n");
+					datagramInfoArray[i].is_intermediate = 1;
+					printf(">>>>>>>>>>>>>>%d\n", datagramInfoArray[i].number_of_fragments);
+				}
+			}
 printf("add print end--------------\n");
 		}else {
-                        update_Send_Time(ts);
+            update_Send_Time(ts);
 		}
 	}
 	if( !(ip->ip_off&IP_DF) && (ip->ip_off&IP_MF)) {  //check if the packet is the fragment of the original datagram
@@ -295,13 +312,23 @@ void print_result() {
 				printf("Other protocol:%d, please check in.h", protocolArray[i]);
 		}
 	}
-	for(i=1; i<(fragmentCount/2)+1; i++) {
-		printf("The number of fragments created from the original datagram D%d is:%d\n",i, (fragmentCount/fragmentCount));
-		printf("The offset of the last fragment is: %d\n", theLastFragment);
+	int j = 0;
+	for(i = 0; i < datagramInfoArrayLength; i++){
+		if(!datagramInfoArray[i].is_intermediate){
+			continue;
+		}
+		printf("The number of fragments created from the original datagram D%d is:%d\n",j, datagramInfoArray[i].number_of_fragments);
+		printf("The offset of the last fragment is: %d\n", datagramInfoArray[i].last_fragment_offset);
+		j++;
 	}
+//	for(i=1; i<(fragmentCount/2)+1; i++) {
+//		printf("The number of fragments created from the original datagram D%d is:%d\n",i, (fragmentCount/fragmentCount));
+//		printf("The offset of the last fragment is: %d\n", theLastFragment);
+//	}
 	printf("\n");
 	for(i=0; i<inters.size; i++) {
 		avgRTT(inters.intermediate[i]);
+		printf("inters size is:%d\n ", inters.intermediate[i]);
 	}
 }
 
