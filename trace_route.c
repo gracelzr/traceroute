@@ -6,6 +6,7 @@
 #include <pcap.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
 #include <net/if.h>
 #include <netinet/if_ether.h>
 #include <arpa/inet.h>
@@ -20,6 +21,18 @@ int protocolArray[10]; //The values in the protocol field of IP headers. the val
 int protoSize = 0;	//count the num of protocol values
 int firstPacket = 1;	//the firstPacket is sent by trace route, so we can record its src IP address and dst address
 int start = 0;
+
+struct datagramInfo{
+	char key[50];
+	int number_of_fragments;	
+	int last_fragment_offset;
+};
+
+
+struct datagramInfo* datagramInfoArray;
+int datagramInfoArrayLength;
+int datagramInfoArraySize;
+
 struct sendInfo{
 	struct timeval time[1000];
 	int head;
@@ -111,6 +124,32 @@ void Protocol_Type(int type) {  //if find new protocol type, add it to the proto
 	protoSize++;
 }
 
+void updateDatagramInfo(char* key, unsigned short fragment_offset){
+	printf("Key: %s Offset: %u\n", key, (fragment_offset * 8));
+	int i;
+	for(i = 0; i < datagramInfoArrayLength; i++){
+		puts(datagramInfoArray[i].key);
+		if(strcmp(datagramInfoArray[i].key, key) == 0){
+			datagramInfoArray[i].number_of_fragments++;
+			if(fragment_offset > datagramInfoArray[i].last_fragment_offset){
+				datagramInfoArray[i].last_fragment_offset = fragment_offset;
+			}
+			printf("Fragment detected!!!!\n");
+			return;
+		}
+	}
+	if(datagramInfoArrayLength == datagramInfoArraySize){
+		datagramInfoArray = realloc(datagramInfoArray, datagramInfoArraySize * 2);
+		printf(">>>>>>%f\n", datagramInfoArray);
+		datagramInfoArraySize *= 2;
+	}
+	strcpy(datagramInfoArray[datagramInfoArrayLength].key, key);
+	datagramInfoArray[datagramInfoArrayLength].number_of_fragments = 0;
+	datagramInfoArray[datagramInfoArrayLength].last_fragment_offset = 0;
+	datagramInfoArrayLength++;
+	printf(">>>>Information updated: %d %d\n", datagramInfoArrayLength, datagramInfoArraySize);
+}
+
 void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int cap_length){
 	struct ip *ip;
 	struct icmphdr *icmp;
@@ -125,6 +164,30 @@ void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int
 	packet += sizeof(struct ether_header);
 	ip = (struct ip*) packet;
 	int protocol_type = ip->ip_p;
+	int icmpHeaderOffset = ip->ip_hl << 2;
+	printf("Header size: %d\n", icmpHeaderOffset);
+	icmp = (struct icmphdr*) (packet + icmpHeaderOffset);
+	int icmp_code = icmp->code;
+	printf("IP_P: %d\n", ip->ip_p);
+	char isIntermediateNode = (ip->ip_p == 1 && icmp->code == 0 &&icmp->type == 11);
+	int temp = ip->ip_id;
+	int id = (temp>>8) | (temp<<8);
+	char* src_ip_str = inet_ntoa(ip->ip_src);
+	char* dst_ip_str = inet_ntoa(ip->ip_dst);
+	char key[50];
+	sprintf(key, "%s:%s:%d", src_ip_str, dst_ip_str, id);
+	//printf(">>>>>%s\n", key);
+	temp = ip->ip_off & 0xFF1F;
+	unsigned short offset = (temp>>8) | (temp<<8);
+	updateDatagramInfo(key, offset);
+	//printf(">>>>%u\n", ip->ip_off);
+	if(ip->ip_p == 1 && icmp->code == 0 &&icmp->type == 11){
+		printf("ICMP_CODE: %u\n", icmp->code);
+		printf("ICMP_TYPE: %u\n", icmp->type);
+		printf("======Time-to-live exceeded======\n");
+		printf("Src: %s\n", inet_ntoa(ip->ip_src));	
+		printf("Dst: %s\n", inet_ntoa(ip->ip_dst));
+	}
 	Protocol_Type(protocol_type);
 //	if(protocol_type != IPPROTO_ICMP) return ;
 	if((ip->ip_p==IPPROTO_UDP) && (ip->ip_ttl==1) && firstPacket) { //the first packet is sent by the trace route. so the ip addr of the source node is the packet's source ip.the ip of the destination is ip dst of the packet
@@ -142,7 +205,7 @@ void analyze_packet(const unsigned char *packet, struct timeval ts, unsigned int
 //printf("src address is ------%s\n",inet_ntoa(src));
 //printf("src add ------%s\n",inet_ntoa(ip->ip_src));
 //printf("dst add ------%s\n",inet_ntoa(ip->ip_dst));
-		if((ip->ip_src.s_addr != src.s_addr) && (ip->ip_dst.s_addr == src.s_addr)) {
+		if((ip->ip_src.s_addr != src.s_addr) && (ip->ip_dst.s_addr == src.s_addr) && isIntermediateNode) {
 printf("add print start--------------\n");
 printf("src add ------%s\n",inet_ntoa(ip->ip_src));
 printf("dst add ------%s\n",inet_ntoa(ip->ip_dst));
@@ -167,8 +230,8 @@ printf("add print end--------------\n");
 		if(ip->ip_dst.s_addr != src.s_addr ){
 		
 			theLastFragment = cap_length;
- printf("the last frag is %d\n", cap_length);
-                printf("bbbbbb\n");
+			printf("the last frag is %d\n", cap_length);
+			printf("bbbbbb\n");
 		} 
 //printf("add print start--------------\n");
 //printf("src add ------%s\n",inet_ntoa(ip->ip_src));
@@ -247,6 +310,10 @@ int main(int argc, char *argv[]){
 	const unsigned char *packet;
 	char errbuf[PCAP_ERRBUF_SIZE];
 	struct pcap_pkthdr header;
+	datagramInfoArray = malloc(sizeof(struct datagramInfo) * 1);
+	datagramInfoArrayLength = 0;
+	datagramInfoArraySize = 1;
+
 
 	if (argc < 2){
 		fprintf(stderr, "Usage: %s <pcap>\n", argv[0]);
